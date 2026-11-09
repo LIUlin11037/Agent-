@@ -7,8 +7,9 @@
   4. history  —— 最近若干轮原文（含本轮用户输入）。
 
 压缩策略：按"轮"切分（user 开头），保留最近 keep_recent_turns 轮原文，
-更早的交给 LLM 压成摘要，并推进水位线 compressed_upto。
-原始消息仍留在库里，只是不再进入上下文——既省 token 又可审计。
+更早的按字符预算分成若干批，逐批交给 LLM 压成摘要，并推进水位线 compressed_upto。
+水位线只推进到"确实进入过压缩输入"的最后一轮——批次之外的轮次仍留在活动上下文里，
+不会被静默丢掉。原始消息始终留在库里，只是不再进入上下文。
 """
 
 from __future__ import annotations
@@ -60,6 +61,13 @@ COMPRESS_TEMPLATE = """已有摘要：
 3. 丢弃寒暄、重复内容和被否定的中间尝试。
 4. 用短句和分号连接，不要分点标题。"""
 
+# 单次压缩调用的输入预算。超过就分批，而不是截断后仍推进水位线。
+COMPRESS_BATCH_CHARS = 6000
+# 一次装配最多做几批，避免压缩本身把这一轮拖太久；没轮到的轮次下次再压。
+COMPRESS_MAX_BATCHES = 3
+# 单条消息单独截断，防止一个超大工具结果挤占整批预算；截断会留下标记。
+COMPRESS_MESSAGE_CHARS = 1500
+
 
 def estimate_tokens(text: str) -> int:
     """粗估 token：中文按 1 字 ≈ 1 token，其余按 4 字符 ≈ 1 token。"""
@@ -90,6 +98,53 @@ def group_turns(messages: Sequence[Message]) -> list[list[Message]]:
     if current:
         turns.append(current)
     return turns
+
+
+def render_turns(
+    turns: Sequence[Sequence[Message]], per_message: int = COMPRESS_MESSAGE_CHARS
+) -> str:
+    """把若干轮对话渲染成压缩输入。单条超长消息会截断并留下标记。"""
+    lines: list[str] = []
+    for turn in turns:
+        for message in turn:
+            text = (message.content or "").replace("\n", " ").strip()
+            if len(text) > per_message:
+                text = text[:per_message] + "…（截断）"
+            if message.role == "assistant" and message.tool_calls:
+                names = ", ".join(
+                    str(call.get("function", {}).get("name", "?")) for call in message.tool_calls
+                )
+                text = f"{text} [调用工具: {names}]".strip()
+            if text:
+                lines.append(f"{message.role}: {text}")
+    return "\n".join(lines)
+
+
+def plan_batches(
+    turns: Sequence[Sequence[Message]],
+    budget: int = COMPRESS_BATCH_CHARS,
+    max_batches: int = COMPRESS_MAX_BATCHES,
+) -> list[list[list[Message]]]:
+    """按字符预算把"冷轮次"分批，保证每批的完整内容都进得了压缩输入。
+
+    最多返回 max_batches 批；没轮到的轮次会留在活动上下文里，等下一次压缩。
+    """
+    batches: list[list[list[Message]]] = []
+    current: list[list[Message]] = []
+    size = 0
+    for turn in turns:
+        block = render_turns([turn])
+        if current and size + len(block) > budget:
+            batches.append(current)
+            current = []
+            size = 0
+            if len(batches) >= max_batches:
+                return batches
+        current.append(list(turn))
+        size += len(block)
+    if current and len(batches) < max_batches:
+        batches.append(current)
+    return batches
 
 
 class ContextBuilder:
@@ -176,56 +231,56 @@ class ContextBuilder:
         if not old_turns:
             return False
 
-        chunk = self._render_chunk(old_turns)
-        if not chunk.strip():
+        batches = plan_batches(old_turns)
+        if not batches:
             return False
 
-        prompt = COMPRESS_TEMPLATE.format(summary=session.summary or "（无）", chunk=chunk)
-        try:
-            response = self.llm.chat(
-                [
-                    Message(role="system", content=COMPRESS_SYSTEM),
-                    Message(role="user", content=prompt),
-                ]
-            )
-            new_summary = (response.content or "").strip()
-        except Exception as exc:  # 压缩失败不能拖垮主流程
+        summary = session.summary
+        processed: list[list[Message]] = []
+
+        for batch in batches:
+            chunk = render_turns(batch)
+            if not chunk.strip():
+                processed.extend(batch)
+                continue
+
+            prompt = COMPRESS_TEMPLATE.format(summary=summary or "（无）", chunk=chunk)
             new_summary = ""
-            if self.tracer:
-                self.tracer.log("compress_failed", error=str(exc))
+            try:
+                response = self.llm.chat(
+                    [
+                        Message(role="system", content=COMPRESS_SYSTEM),
+                        Message(role="user", content=prompt),
+                    ]
+                )
+                new_summary = (response.content or "").strip()
+            except Exception as exc:  # 压缩失败不能拖垮主流程
+                if self.tracer:
+                    self.tracer.log("compress_failed", error=str(exc), turns=len(batch))
 
-        if not new_summary:
-            new_summary = self._mechanical_summary(session.summary, chunk)
+            if not new_summary:
+                new_summary = self._mechanical_summary(summary, chunk)
+            summary = new_summary
+            processed.extend(batch)
 
-        compressed_upto = old_turns[-1][-1].seq
-        self.store.save_summary(session, new_summary, compressed_upto)
+        if not processed:
+            return False
+
+        # 水位线只推进到真正进入过压缩输入的最后一轮：
+        # 批次之外的历史仍留在活动上下文里，不会因为"没来得及压"而消失。
+        compressed_upto = processed[-1][-1].seq
+        self.store.save_summary(session, summary, compressed_upto)
         if self.tracer:
             self.tracer.log(
                 "compress",
-                turns=len(old_turns),
+                batches=len(batches),
+                turns=len(processed),
                 kept_turns=keep_n,
                 compressed_upto=compressed_upto,
-                summary_chars=len(new_summary),
+                summary_chars=len(summary),
+                remaining_turns=len(turns) - len(processed),
             )
         return True
-
-    @staticmethod
-    def _render_chunk(turns: list[list[Message]], per_message: int = 400, total: int = 6000) -> str:
-        lines: list[str] = []
-        for turn in turns:
-            for message in turn:
-                text = (message.content or "").replace("\n", " ").strip()
-                if len(text) > per_message:
-                    text = text[:per_message] + "…"
-                if message.role == "assistant" and message.tool_calls:
-                    names = ", ".join(
-                        str(call.get("function", {}).get("name", "?")) for call in message.tool_calls
-                    )
-                    text = f"{text} [调用工具: {names}]".strip()
-                if text:
-                    lines.append(f"{message.role}: {text}")
-        chunk = "\n".join(lines)
-        return chunk[:total]
 
     @staticmethod
     def _mechanical_summary(existing: str, chunk: str) -> str:

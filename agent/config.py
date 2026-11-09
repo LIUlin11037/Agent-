@@ -54,7 +54,6 @@ class Config:
     keep_recent_turns: int = 6
     max_tool_output_chars: int = 4_000
 
-    tool_timeout: float = 8.0
     llm_timeout: float = 60.0
     llm_retries: int = 2
 

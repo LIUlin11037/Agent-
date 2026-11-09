@@ -141,6 +141,37 @@ def test_loop_guard_handles_parallel_calls(make_runtime):
     assert result.steps == 3
 
 
+def test_loop_guard_blocks_before_side_effect(make_runtime):
+    """写工具不能"先执行三次再拦截"，第三次必须在执行前被挡住。"""
+    same_call = {
+        "tool_calls": [{"name": "todo", "arguments": {"action": "add", "content": "重复记的事"}}]
+    }
+    runtime, _ = make_runtime([same_call, same_call, same_call])
+    result = runtime.chat("u1", "一直记同一条")
+
+    assert result.stopped_reason == "loop_guard"
+    # 第 1、2 次真的执行，第 3 次被拦，所以库里只能有两条
+    assert len(runtime.store.list_todos("u1")) == 2
+
+
+def test_trace_turn_increments_across_chats(make_runtime):
+    """同一会话多次对话，trace 的 turn 要接着数，不能每条都是 1。"""
+    import json
+    from pathlib import Path
+
+    runtime, _ = make_runtime(["第一轮回答", "第二轮回答"])
+    runtime.chat("u1", "第一轮", session_id="t1")
+    second = runtime.chat("u1", "第二轮", session_id="t1")
+
+    events = [
+        json.loads(line)
+        for line in Path(second.trace_path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    turns = sorted({event["turn"] for event in events if event["event"] == "user_input"})
+    assert turns == [1, 2]
+
+
 def test_llm_error_returns_friendly_message(make_runtime):
     runtime, _ = make_runtime([LLMError("连接超时")])
     result = runtime.chat("u1", "你好")

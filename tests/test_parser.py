@@ -75,6 +75,31 @@ def test_text_protocol_action_without_arguments_is_final():
     assert decision.kind == "final"
 
 
+def test_broken_tool_json_is_invalid_not_final():
+    """被截断的工具调用不能被当成最终答案甩给用户，要进修复流程。"""
+    decision = parse_response(resp('{"tool": "weather", "arguments": {"city": "北'))
+    assert decision.kind == "invalid"
+    assert "工具调用" in (decision.error or "")
+
+
+def test_broken_fenced_tool_json_is_invalid():
+    content = '我查一下：\n```json\n{"tool": "weather", "arguments": {"city": "北\n```'
+    decision = parse_response(resp(content))
+    assert decision.kind == "invalid"
+
+
+def test_plain_json_answer_with_name_stays_final():
+    """普通 JSON 回答里出现 name 字段，不能被误判成工具调用。"""
+    decision = parse_response(resp('{"name": "小林", "city": "北京"}'))
+    assert decision.kind == "final"
+    assert decision.text.startswith("{")
+
+
+def test_plain_json_answer_stays_final():
+    decision = parse_response(resp('{"city": "北京", "temperature": 6}'))
+    assert decision.kind == "final"
+
+
 def test_thinking_tag_extracted():
     decision = parse_response(resp("<thinking>先算乘法再算加法</thinking>结果是 12"))
     assert "先算乘法" in decision.thinking

@@ -25,3 +25,16 @@ class SummaryLLM(FakeLLM):
             self.calls.append({"messages": [m.to_openai() for m in messages], "tools": tools})
             return LLMResponse(content=self.summary)
         return super().chat(messages, tools)
+
+
+class RecordingSummaryLLM(SummaryLLM):
+    """记录每次压缩实际喂进去的文本，用来断言"没有历史被静默丢掉"。"""
+
+    def __init__(self, summary: str = "【摘要】用户连续问了很多轮。") -> None:
+        super().__init__([], summary=summary)
+        self.prompts: list[str] = []
+
+    def chat(self, messages, tools=None):
+        if messages and messages[0].role == "system" and messages[0].content == COMPRESS_SYSTEM:
+            self.prompts.append(messages[1].content)
+        return super().chat(messages, tools)

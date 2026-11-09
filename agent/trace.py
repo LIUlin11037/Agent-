@@ -20,8 +20,23 @@ class Tracer:
         self.session_id = session_id
         self.path = self.dir / f"{session_id}.jsonl"
         self.echo = echo
-        self.turn = 0
+        # 同一会话的多次对话会复用同一个 trace 文件，turn 必须接着历史往下数，
+        # 否则每条记录都显示 turn=1，按轮复盘时无法区分。
+        self.turn = self._existing_turns()
         self.step = 0
+
+    def _existing_turns(self) -> int:
+        if not self.path.exists():
+            return 0
+        count = 0
+        try:
+            with self.path.open(encoding="utf-8") as fh:
+                for line in fh:
+                    if '"event": "user_input"' in line:
+                        count += 1
+        except OSError:
+            return 0
+        return count
 
     def new_turn(self) -> int:
         self.turn += 1

@@ -35,6 +35,9 @@ REPEAT_HINT = (
     "请基于已有结果作答；如果信息不足，就如实说明缺少什么。"
 )
 
+# 同一 (工具, 参数) 允许执行的次数上限。达到之前用提示纠正，达到即拦截。
+REPEAT_LIMIT = 3
+
 
 class AgentRuntime:
     def __init__(
@@ -60,6 +63,8 @@ class AgentRuntime:
         session = self.store.ensure_session(user_id, session_id)
         tracer = Tracer(self.config.trace_dir, session.id, echo=self.echo_trace)
         tracer.new_turn()
+        # 让压缩等发生在 ContextBuilder 里的事件也能写进本次对话的 trace
+        self.context.tracer = tracer
 
         self.store.append_message(session, Message(role="user", content=text))
         if not session.title:
@@ -144,10 +149,46 @@ class AgentRuntime:
                 )
 
             # ---- 工具调用 ----
+            # 先算指纹和"预计执行次数"：写工具不能等到执行完才发现是第三次重复，
+            # 否则 todo(add) 会真的落三条数据。重复达到上限时，在执行前直接拦截。
+            fingerprints = [
+                f"{call.name}:{json.dumps(call.arguments, sort_keys=True, ensure_ascii=False)}"
+                for call in decision.tool_calls
+            ]
+            projected = dict(repeat_counts)
+            blocked_key: str | None = None
+            for key in fingerprints:
+                projected[key] = projected.get(key, 0) + 1
+                if projected[key] >= REPEAT_LIMIT:
+                    blocked_key = key
+                    break
+
+            if blocked_key:
+                name = blocked_key.split(":", 1)[0]
+                tracer.log(
+                    "loop_guard",
+                    name=name,
+                    repeats=projected[blocked_key],
+                    blocked_before_execute=True,
+                )
+                reply = (
+                    f"我准备第 {projected[blocked_key]} 次用相同参数调用 {name}，结果不会变化，"
+                    "所以这次没有再执行。可以补充一些信息，或者换个问法。"
+                )
+                self.store.append_message(session, Message(role="assistant", content=reply))
+                return ChatResult(
+                    session_id=session.id,
+                    reply=reply,
+                    steps=step,
+                    tool_calls=tool_records,
+                    stopped_reason="loop_guard",
+                    usage=usage_total,
+                    trace_path=str(tracer.path),
+                )
+
             self._append_assistant_tool_calls(session, decision)
 
-            for call in decision.tool_calls:
-                key = f"{call.name}:{json.dumps(call.arguments, sort_keys=True, ensure_ascii=False)}"
+            for call, key in zip(decision.tool_calls, fingerprints, strict=True):
                 repeat_counts[key] = repeat_counts.get(key, 0) + 1
 
                 tracer.log("tool_call", name=call.name, arguments=call.arguments, step=step)
@@ -191,24 +232,7 @@ class AgentRuntime:
 
             worst_key, worst_count = max(repeat_counts.items(), key=lambda item: item[1], default=("", 0))
 
-            if worst_count >= 3:
-                tracer.log("loop_guard", name=worst_key, repeats=worst_count)
-                reply = (
-                    "我连续多次用相同参数调用同一个工具，结果不会变化，因此先停在这里。"
-                    "可以补充一些信息，或者换个问法。"
-                )
-                self.store.append_message(session, Message(role="assistant", content=reply))
-                return ChatResult(
-                    session_id=session.id,
-                    reply=reply,
-                    steps=step,
-                    tool_calls=tool_records,
-                    stopped_reason="loop_guard",
-                    usage=usage_total,
-                    trace_path=str(tracer.path),
-                )
-
-            elif worst_count == 2 and worst_key not in hinted:
+            if worst_count == REPEAT_LIMIT - 1 and worst_key not in hinted:
                 name = worst_key.split(":", 1)[0]
                 hinted.add(worst_key)
                 tracer.log("repeat_hint", name=name)

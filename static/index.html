@@ -316,7 +316,7 @@ async function selectSession(id) {
   renderSessions();
   const session = state.sessions.find((s) => s.id === id);
   $("title").innerHTML = `${esc(session ? session.title || "(无标题)" : id)}<span>${esc(id)}</span>`;
-  const messages = await api(`/api/sessions/${encodeURIComponent(id)}/messages`);
+  const messages = await api(`/api/sessions/${encodeURIComponent(id)}/messages?user_id=${encodeURIComponent(state.userId)}`);
   renderMessages(messages);
 }
 
@@ -363,7 +363,7 @@ async function send() {
 
 async function openTrace() {
   if (!state.sessionId) return;
-  const records = await api(`/api/sessions/${encodeURIComponent(state.sessionId)}/trace?limit=80`);
+  const records = await api(`/api/sessions/${encodeURIComponent(state.sessionId)}/trace?limit=80&user_id=${encodeURIComponent(state.userId)}`);
   $("traceCount").textContent = records.length ? `${records.length} 条` : "";
   $("traceBody").innerHTML = records.length
     ? records.map((r) => {

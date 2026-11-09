@@ -29,6 +29,22 @@ _TOOL_KEYS = ("tool", "tool_name", "name")
 _ARG_KEYS = ("arguments", "args", "parameters", "input", "action_input")
 _FINAL_ACTIONS = {"final", "answer", "respond"}
 _META_ACTIONS = {"tool", "call", "use", ""}
+# 出现这些键，说明模型大概率是在描述一次工具调用，而不是在回答数据
+_BROKEN_TOOL_KEYS = ('"tool":', '"tool_name":', '"arguments":', '"action_input":')
+
+
+def _looks_like_broken_tool_call(body: str) -> bool:
+    """判断一段解析不了的正文，是不是"想调工具但 JSON 坏了"。
+
+    必须同时满足两件事才判 invalid：结构上像调用（以 `{` 开头，或带 json 代码块），
+    并且出现了工具/参数键。否则会把普通的 JSON 回答误伤成解析失败。
+    """
+    text = (body or "").strip()
+    if not text or not any(key in text for key in _BROKEN_TOOL_KEYS):
+        return False
+    if text.startswith("{"):
+        return True
+    return "```" in text and "json" in text.lower()
 
 
 def extract_thinking(text: str) -> tuple[str, str]:
@@ -132,12 +148,19 @@ def _decision_from_payload(payload: dict[str, Any], thinking: str, raw: str) -> 
         )
 
     name = ""
+    name_from = ""
     for key in _TOOL_KEYS:
         if payload.get(key):
             name = str(payload[key])
+            name_from = key
             break
 
     args_key_present = any(key in payload for key in _ARG_KEYS)
+
+    # "name" 也是普通数据里常见的键（比如 {"name": "小林"}）。
+    # 只有同时带了参数键，才把它当成工具名，避免把正常 JSON 回答误判成调用。
+    if name_from == "name" and not args_key_present:
+        name = ""
 
     # ReAct 风格：{"thought": ..., "action": "weather", "action_input": {...}}
     # action 不是 final/tool 这类元动作，又带着参数，就把它当工具名。
@@ -223,5 +246,16 @@ def parse_response(response: LLMResponse) -> Decision:
         decision = _decision_from_payload(payload, thinking, raw)
         if decision:
             return decision
+
+    # 正文非空、但明显是"坏掉的工具调用"时，不能当最终答案直接给用户，
+    # 要交给 runtime 走修复重试（例如被截断的 {"tool": ..., "arguments": ...}）。
+    if _looks_like_broken_tool_call(body):
+        return Decision(
+            kind="invalid",
+            thinking=thinking,
+            raw=raw,
+            protocol="text",
+            error="输出看起来是工具调用，但 JSON 不完整或格式错误",
+        )
 
     return Decision(kind="final", thinking=thinking, text=body.strip(), raw=raw, protocol="fallback")

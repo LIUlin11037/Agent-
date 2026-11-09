@@ -10,7 +10,7 @@ from agent.context import (
     group_turns,
 )
 from agent.types import Message
-from tests.helpers import SummaryLLM
+from tests.helpers import RecordingSummaryLLM, SummaryLLM
 
 
 def _system_text(messages) -> str:
@@ -190,6 +190,75 @@ def test_follow_up_survives_compression(config):
     sent = _system_text(llm.calls[-1]["messages"])
     assert "上次工具调用" in sent
     assert "北京" in sent
+
+
+def test_compression_batches_instead_of_dropping_history(config, store):
+    """一次压缩装不下的历史要分批，不能"截断输入但仍推进水位线"把历史弄丢。"""
+    config.max_context_tokens = 1000
+    config.compress_threshold = 0.5
+    config.keep_recent_turns = 1
+
+    llm = RecordingSummaryLLM()
+    builder = ContextBuilder(config, llm=llm, store=store)
+    session = store.create_session("user_a", title="long")
+    for index in range(20):
+        store.append_message(session, Message(role="user", content=f"第{index}轮问题：" + "背景" * 400))
+        store.append_message(
+            session, Message(role="assistant", content=f"第{index}轮回答：" + "结论" * 400)
+        )
+
+    assert builder.maybe_compress(session) is True
+    assert len(llm.prompts) >= 2, "超过单批预算时应分批压缩"
+
+    joined = "\n".join(llm.prompts)
+    compressed = [message for message in session.messages if message.seq <= session.compressed_upto]
+    assert compressed
+    for message in compressed:
+        assert message.content[:12] in joined, "被压掉的消息必须真的进入过压缩输入"
+
+    assert session.compressed_upto < session.messages[-1].seq, "没轮到的历史应留在活动上下文里"
+
+
+def test_pure_chat_follow_up_uses_prior_turn(make_runtime):
+    """回答依据必须来自上下文：换一个窗口问同样的问题，答案应该不同。"""
+
+    def step(messages, tools):
+        joined = " ".join(message.get("content", "") for message in messages)
+        if "我叫小林" in joined:
+            return "你叫小林。"
+        return "我不知道你的名字。"
+
+    runtime, _ = make_runtime([step, step, step])
+    runtime.chat("user_a", "我叫小林", session_id="w1")
+    follow = runtime.chat("user_a", "我叫什么", session_id="w1")
+    assert follow.reply == "你叫小林。"
+
+    other_window = runtime.chat("user_a", "我叫什么", session_id="w2")
+    assert other_window.reply == "我不知道你的名字。"
+
+
+def test_tool_follow_up_actually_executes_new_call(make_runtime):
+    """追问要真的发起"上海"的工具调用，而不只是把上次参数放进上下文。"""
+
+    def step(messages, tools):
+        system_text = "\n".join(
+            message["content"] for message in messages if message["role"] == "system"
+        )
+        if "上次工具调用" in system_text and "北京" in system_text:
+            return {"tool_calls": [{"name": "weather", "arguments": {"city": "上海"}}]}
+        return {"tool_calls": [{"name": "weather", "arguments": {"city": "北京"}}]}
+
+    runtime, _ = make_runtime([step, "北京小雨。", step, "上海晴。"])
+    first = runtime.chat("user_a", "北京天气怎么样", session_id="w1")
+    second = runtime.chat("user_a", "那上海呢", session_id="w1")
+
+    assert first.tool_calls[0]["arguments"]["city"] == "北京"
+    assert second.tool_calls[0]["name"] == "weather"
+    assert second.tool_calls[0]["arguments"]["city"] == "上海"
+    assert second.tool_calls[0]["ok"] is True
+
+    tool_messages = [message for message in runtime.history("w1") if message.role == "tool"]
+    assert any("上海" in message.content for message in tool_messages)
 
 
 def test_context_builder_direct_use(config, store):

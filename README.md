@@ -16,7 +16,7 @@
 - **会话真正隔离**：每个窗口独立上下文，进程重启后可原样恢复
 - **上下文三层记忆**：原文 + 滚动摘要 + 结构化状态，超长自动压缩，追问不断片
 - **异常不逃逸**：工具报错、参数非法、模型乱输出都回喂给模型自愈，主循环不崩
-- **96 个离线测试**：`pytest` 直接跑，不需要 API Key
+- **105 个离线测试**：`pytest` 直接跑，不需要 API Key
 
 ## 需求对照
 
@@ -29,7 +29,7 @@
 | 多窗口 session 隔离、可恢复 | `agent/session.py` | `test_session.py`、`test_server.py` |
 | 最大轮次限制、追问、上下文压缩 | `agent/runtime.py`、`agent/context.py` | `test_loop.py`、`test_context.py` |
 | 异常处理、工具调用 trace | `agent/runtime.py`、`agent/trace.py` | `test_loop.py` |
-| 测试用例 | `tests/` | 96 passed / 3 skipped |
+| 测试用例 | `tests/` | 105 passed / 3 skipped |
 
 ## 快速开始
 
@@ -45,7 +45,7 @@ pip install -r requirements.txt
 
 ```bash
 pytest
-# 96 passed, 3 skipped
+# 105 passed, 3 skipped
 ```
 
 测试用 `FakeLLM` 脚本化回放模型响应，覆盖循环、解析、异常、会话隔离、追问与压缩。
@@ -94,7 +94,7 @@ agent/
 ├── runtime.py      主循环：唯一的"转圈"逻辑，含终止条件与异常兜底
 ├── parser.py       输出解析：tool_calls / 文本 JSON / 修复 / 降级
 ├── llm.py          LLM 客户端抽象：DeepSeekLLM + FakeLLM（测试用）
-├── context.py      上下文装配、token 估算、滚动摘要压缩
+├── context.py      上下文装配、token 估算、分批滚动摘要
 ├── session.py      SQLite 存储：sessions / messages / todos
 ├── trace.py        JSONL 执行轨迹
 └── tools/
@@ -106,7 +106,7 @@ agent/
     └── read_docs.py   读取本地文档
 cli.py              多窗口命令行
 server.py           可选 Web 演示（FastAPI + 单页）
-tests/              96 个离线用例
+tests/              105 个离线用例
 data/               mock 语料与文档
 ```
 
@@ -122,17 +122,17 @@ data/               mock 语料与文档
 4. 工具调用 → Schema 校验 → 执行 → 结果作为 observation 回填 → 回到 1
 5. 最终答案 → 落库 → 返回
 
-终止条件有三类，都是显式的：
+终止条件有四类，都是显式的：
 
 | 终止原因 | 触发条件 | 用户看到什么 |
 |---|---|---|
 | `final` | 模型给出最终答案 | 正常回复 |
-| `max_steps` | 单轮工具步数超过 `AGENT_MAX_STEPS`（默认 8） | 说明已停止，提示拆小问题 |
-| `loop_guard` | 相同 `(工具, 参数)` 连续调用 3 次 | 说明在重复调用，主动停下 |
+| `max_steps` | 单轮工具步数达到 `AGENT_MAX_STEPS`（默认 8） | 说明已停止，提示拆小问题 |
+| `loop_guard` | 相同 `(工具, 参数)` 第 3 次调用**在执行前**被拦截 | 说明在重复调用，主动停下 |
 | `error` | 模型不可用 / 输出两次无法解析 | 友好的失败说明 |
 
 `loop_guard` 是为了防止模型陷入"调用—无进展—再调用"的死循环：第 2 次重复时先注入一条提示，
-第 3 次直接打断。
+第 3 次**在执行前拦截**。这一点对写工具很关键——否则 `todo(add)` 会真的落三条数据。
 
 ### 2. 输出解析：为什么要两条协议
 
@@ -220,8 +220,10 @@ def calculator(args, ctx) -> str: ...
 - **触发**：估算 token 超过 `max_context_tokens × compress_threshold`（默认 12000 × 0.7）
 - **切分**：按"轮"切（以 user 消息为界），保证 `assistant.tool_calls` 与 `tool` 结果不被拆开
 - **保留**：最近 `keep_recent_turns` 轮原文不动，更早的交给 LLM 压成 400 字以内的摘要
-- **落库**：推进 `compressed_upto` 水位线；原始消息**不删除**，只是不再进入上下文（可审计、可回放）
-- **兜底**：压缩用的 LLM 调用失败时，退化为机械截断摘要，主流程不中断
+- **分批**：单次压缩输入按 6000 字符分批（最多 3 批），装不下的轮次留在活动上下文里，下次再压；
+  不会出现"输入被截断、水位线却越过了没压过的历史"这种静默丢失
+- **落库**：`compressed_upto` 只推进到**真正进入过压缩输入**的最后一轮；原始消息**不删除**，只是不再进入上下文（可审计、可回放）
+- **兜底**：某一批的 LLM 调用失败时，该批退化为机械截断摘要，主流程不中断
 
 token 估算用中英文分权（中文 1 字 ≈ 1 token，英文 4 字符 ≈ 1 token），比 tiktoken 便宜且够用。
 
@@ -230,7 +232,7 @@ token 估算用中英文分权（中文 1 字 ≈ 1 token，英文 4 字符 ≈ 
 | 场景 | 处理方式 |
 |---|---|
 | 模型超时 / 限流 | 指数退避重试 2 次，仍失败则返回友好提示（`stopped_reason=error`） |
-| 输出无法解析 | 追加纠正提示重试一次，二次失败才放弃 |
+| 输出无法解析（含被截断的工具 JSON） | 判 `invalid` 后追加纠正提示重试一次，不会被当成最终答案；二次失败才放弃 |
 | 工具不存在 / 参数非法 | 校验失败信息作为 observation 回喂，模型自行修正 |
 | 工具内部抛异常 | 捕获并转成 `ToolResult(ok=False)`，循环继续 |
 | 工具输出过长 | 入库前按 `AGENT_MAX_TOOL_OUTPUT` 截断，防止一次爆上下文 |
@@ -248,7 +250,7 @@ token 估算用中英文分权（中文 1 字 ≈ 1 token，英文 4 字符 ≈ 
 user_input → llm_request → llm_response → parse → tool_call → tool_result → ... → final
 ```
 
-每条记录带 `turn` / `step` / 时间戳 / 耗时 / token 用量。`/trace` 命令或 Web 的
+公共字段是 `turn` / `step` / 时间戳；LLM 与工具事件另外带耗时、token 用量和结果预览（完整内容在 `messages` 表）。`/trace` 命令或 Web 的
 "执行轨迹"面板可以直接查看，排障和复盘都用它。
 
 ## 测试
@@ -261,12 +263,12 @@ AGENT_LIVE_TEST=1 pytest tests/test_live.py   # 真实模型的端到端用例�
 
 | 文件 | 覆盖内容 |
 |---|---|
-| `test_parser.py` | 原生 tool_calls、文本 JSON、思考标签、畸形 JSON、Python 字面量、空响应 |
+| `test_parser.py` | 原生 tool_calls、文本 JSON、思考标签、畸形 JSON、Python 字面量、空响应、截断工具调用判 invalid、普通 JSON 回答不误判 |
 | `test_registry.py` | 工具注册、Schema 生成、类型/枚举/范围/额外字段校验、异常收敛 |
 | `test_tools.py` | 五个工具的正常与异常路径，含代码注入拦截 |
-| `test_loop.py` | 直接回答、单工具、多步链、并行工具、max_steps、修复重试、工具报错自愈、死循环打断、LLM 故障 |
+| `test_loop.py` | 直接回答、单工具、多步链、并行工具、max_steps、修复重试、工具报错自愈、死循环预执行拦截（写工具不重复落库）、trace turn 递增、LLM 故障 |
 | `test_session.py` | 双窗口隔离、重启恢复、待办共享/隔离、跨用户不可见/不可接管、非法 id 拦截 |
-| `test_context.py` | 状态块注入、纯对话追问、工具追问、压缩触发、压缩后追问、摘要注入、压缩失败兜底 |
+| `test_context.py` | 状态块注入、纯对话追问（换窗口答案不同）、工具追问（真的发起新调用）、压缩触发、分批压缩不丢历史、压缩后追问、摘要注入、压缩失败兜底 |
 | `test_server.py` | Web 路由的会话鉴权：跨用户 403、路径穿越 404、正常对话 |
 
 ## 设计取舍
@@ -292,6 +294,8 @@ AGENT_LIVE_TEST=1 pytest tests/test_live.py   # 真实模型的端到端用例�
 - SQLite 单机存储，未针对高并发写入优化
 - 没有做流式输出（SSE）
 - 单轮内不做跨工具的并行执行（多工具是顺序执行的）
+- 重复调用守卫只识别**完全相同**的 `(工具, 参数)`；参数微调但语义重复的调用拦不住
+- trace 只保留工具结果的前 200 字符预览，定位问题还需配合 `messages` 表
 
 ## 常见问题（排障）
 
