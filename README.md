@@ -300,4 +300,5 @@ AGENT_LIVE_TEST=1 pytest tests/test_live.py   # 真实模型的端到端用例�
 - `calculator` 用 AST 白名单求值，拒绝 `__import__`、属性访问等任意代码执行
 - 工具参数在执行前统一校验，模型无法越权传入额外字段
 
-更多关于提示词设计与踩坑记录见 [docs/AI_PROMPTS.md](docs/AI_PROMPTS.md)。
+完整的 12 条开发提示词原文、Agent system prompt 的四版演进、AI 生成代码的 7 处人工修正，
+以及 20 条问题复盘见 [docs/AI_PROMPTS.md](docs/AI_PROMPTS.md)。
