@@ -139,7 +139,7 @@ data/               mock 语料与文档
 `parse_response()` 把任意模型输出收敛为 `Decision(kind=final | tool_calls | invalid)`：
 
 - **原生 function calling**（主路径）：读 `tool_calls` 字段，逐个解析 `arguments` JSON
-- **文本协议**（兼容路径）：从 ```json 代码块或正文里提取 `{"tool": ..., "arguments": ...}`，
+- **文本协议**（兼容路径）：从 JSON 代码块或正文里提取 `{"tool": ..., "arguments": ...}`，
   也支持 `{"action": "final", "answer": ...}` 和 Python 字面量风格（单引号、`True/False`）
 - **容错**：先尝试标准 JSON，再试去尾逗号、截取第一个括号配平的对象、`ast.literal_eval`
 - **修复**：解析失败时向模型追加一条纠正提示重试一次；仍失败则降级为友好提示
@@ -292,6 +292,58 @@ AGENT_LIVE_TEST=1 pytest tests/test_live.py   # 真实模型的端到端用例�
 - SQLite 单机存储，未针对高并发写入优化
 - 没有做流式输出（SSE）
 - 单轮内不做跨工具的并行执行（多工具是顺序执行的）
+
+## 常见问题（排障）
+
+### 连接类
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `Connection error` / 长时间无响应后 `模型服务暂时不可用` | 网络不通，或 `HTTP(S)_PROXY` 指向的代理不放行 `api.deepseek.com` | 见下方"代理自查" |
+| HTTP 401 | key 错误或已失效 | 检查 `.env` 的 `DEEPSEEK_API_KEY`，注意不要带引号 |
+| HTTP 403 / `Insufficient Balance` | 账号余额或权限问题 | 去服务商控制台确认 |
+| HTTP 429 | 限流 | 代码已指数退避重试 2 次；仍失败会返回友好提示，`stopped_reason=error` |
+
+**代理自查**（把 `7890` 换成你自己的代理端口）：
+
+```bash
+# 返回 401/200 表示代理能到达服务端；000 或 exit 56 表示不通
+curl -x http://127.0.0.1:7890 -s -o /dev/null -w "%{http_code}\n" https://api.deepseek.com/
+```
+
+**临时指定代理**：
+
+```bash
+# macOS / Linux / Git Bash
+HTTPS_PROXY=http://127.0.0.1:7890 HTTP_PROXY=http://127.0.0.1:7890 python cli.py
+```
+
+```powershell
+# Windows PowerShell
+$env:HTTPS_PROXY = "http://127.0.0.1:7890"; python cli.py
+```
+
+网络允许直连时，也可以 `NO_PROXY=api.deepseek.com` 绕开代理。
+注意 SDK（httpx）会自动读取这两个环境变量，**不需要改代码**。
+
+### 行为类
+
+| 现象 | 排查方向 |
+|---|---|
+| 模型不调工具、直接编答案 | 看 trace 的 `llm_request` 是否带 `tools`（Runtime 固定传）；若模型不支持 function calling，会走文本协议，trace 里 `protocol=text` |
+| 追问丢参数（"那上海呢"答成北京） | 看 trace 里 `llm_request` 对应的 system 消息是否包含「上次工具调用」；没有说明 `facts` 没落库 |
+| 回答明显被截断 | 工具输出超过 `AGENT_MAX_TOOL_OUTPUT`（默认 4000 字符）会被截断，结果里会注明原始长度 |
+| 一轮转了很多步才停 | 看 `stopped_reason`：`max_steps` 是步数上限，`loop_guard` 是相同参数重复调用被拦截 |
+
+### 环境类
+
+| 现象 | 处理 |
+|---|---|
+| `ModuleNotFoundError: agent` | 在仓库根目录运行；测试用 `python -m pytest`，不要直接 `pytest` |
+| Windows 控制台乱码 | CLI 已 `reconfigure(encoding="utf-8")`；仍乱码先 `chcp 65001` |
+| Web 端口被占用 | `uvicorn server:app --port 8001` |
+| 没有 key 也想看效果 | `python examples/demo_offline.py`（脚本化假模型，不联网、不花钱） |
+| 想看某次对话发生了什么 | `data/traces/<session_id>.jsonl`，或 CLI `/trace`、Web 轨迹面板 |
 
 ## 安全
 
