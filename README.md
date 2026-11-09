@@ -18,7 +18,22 @@
 - **异常不逃逸**：工具报错、参数非法、模型乱输出都回喂给模型自愈，主循环不崩
 - **96 个离线测试**：`pytest` 直接跑，不需要 API Key
 
+## 需求对照
+
+| 题目要求 | 实现位置 | 验证用例 |
+|---|---|---|
+| 主循环：输入 → 决策 → 工具 → 回填 → 继续/返回 | `agent/runtime.py::chat` | `test_loop.py` |
+| 解析思考过程 / 工具调用 / 最终答案 | `agent/parser.py` | `test_parser.py` |
+| 工具注册（名称、描述、参数 Schema） | `agent/tools/base.py` | `test_registry.py` |
+| 至少 3 个工具，todo 必做 | `agent/tools/`（calculator / search / todo / weather / read_docs） | `test_tools.py` |
+| 多窗口 session 隔离、可恢复 | `agent/session.py` | `test_session.py`、`test_server.py` |
+| 最大轮次限制、追问、上下文压缩 | `agent/runtime.py`、`agent/context.py` | `test_loop.py`、`test_context.py` |
+| 异常处理、工具调用 trace | `agent/runtime.py`、`agent/trace.py` | `test_loop.py` |
+| 测试用例 | `tests/` | 96 passed / 3 skipped |
+
 ## 快速开始
+
+> 需要 Python 3.11+（代码用到 `X | None` 与 `removesuffix`）。
 
 ### 1. 安装依赖
 
